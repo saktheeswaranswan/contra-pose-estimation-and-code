@@ -1,0 +1,165 @@
+// p5.js sketch (no HTML). Paste this as sketch.js
+// YOLOv5/COCO-17 keypoint order + skeleton drawing (correct wiring)
+
+// ---------- SETTINGS ----------
+const JSON_PATH = 'pose_segment_rel_0.00-5.00s(3).json'; // set null to drag-drop
+const MAX_FRAMES = 30;
+const FRAME_W = 1280;
+const FRAME_H = 720;
+const SCALE = 0.5;        // downscale original coords
+const COLS = 6;           // sheet columns
+const LINE_WIDTH = 5;     // pre-scale thickness
+const KP_RADIUS = 6;      // small joint dots (pre-scale)
+const DRAW_JOINT_DOTS = false;
+
+// ---------- COCO 17 KP INDEX ----------
+const K = {
+  nose:0, le:1, re:2, lEar:3, rEar:4,
+  lSh:5, rSh:6, lEl:7, rEl:8, lWr:9, rWr:10,
+  lHip:11, rHip:12, lKn:13, rKn:14, lAn:15, rAn:16
+};
+
+// Skeleton edges for YOLOv5 pose (COCO-17)
+const EDGES = [
+  // torso
+  [K.lSh, K.rSh], [K.lHip, K.rHip], [K.lSh, K.lHip], [K.rSh, K.rHip],
+  // left arm
+  [K.lSh, K.lEl], [K.lEl, K.lWr],
+  // right arm
+  [K.rSh, K.rEl], [K.rEl, K.rWr],
+  // left leg
+  [K.lHip, K.lKn], [K.lKn, K.lAn],
+  // right leg
+  [K.rHip, K.rKn], [K.rKn, K.rAn],
+  // head (face links optional)
+  [K.nose, K.le], [K.nose, K.re], [K.le, K.lEar], [K.re, K.rEar]
+];
+
+// ---------- RUNTIME ----------
+let poseData = null;
+let sheetG;
+let previewW = 420;
+
+function preload() {
+  if (JSON_PATH) poseData = loadJSON(JSON_PATH);
+}
+
+function setup() {
+  createCanvas(previewW, 200);
+  noLoop();
+  enableDragDrop();
+  if (poseData) {
+    poseData = normalizeJSON(poseData);
+    buildSpriteSheet();
+  }
+}
+
+function draw() {
+  background(24);
+  if (sheetG) {
+    const ph = (sheetG.height / sheetG.width) * width;
+    image(sheetG, 0, 0, width, ph);
+    fill(255); noStroke(); textSize(12);
+    text(`sheet: ${sheetG.width}×${sheetG.height}  |  press 's' to save`, 10, height - 8);
+  } else {
+    fill(200); noStroke(); textAlign(CENTER, CENTER);
+    text('Drop your YOLOv5 pose JSON here (or set JSON_PATH).', width/2, height/2);
+  }
+}
+
+function keyPressed() {
+  if ((key === 's' || key === 'S') && sheetG) save(sheetG, 'contra_run_with_gun_spritesheet.png');
+}
+
+// ---------- Build ----------
+function buildSpriteSheet() {
+  const frames = poseData.filter(f => Array.isArray(f.persons) && f.persons.length > 0);
+  const used = frames.slice(0, MAX_FRAMES);
+
+  const w = Math.round(FRAME_W * SCALE);
+  const h = Math.round(FRAME_H * SCALE);
+  const cols = Math.min(COLS, used.length || 1);
+  const rows = Math.ceil(used.length / cols);
+
+  sheetG = createGraphics(cols * w, rows * h);
+  sheetG.clear();
+
+  used.forEach((frame, i) => {
+    const cx = (i % cols) * w;
+    const cy = Math.floor(i / cols) * h;
+    const fg = createGraphics(w, h);
+    fg.clear();
+    fg.push();
+    fg.scale(SCALE, SCALE);
+
+    // draw every detected person (usually 1)
+    for (const person of frame.persons) drawYoloV5Skeleton(fg, person);
+
+    fg.pop();
+    sheetG.image(fg, cx, cy);
+    fg.remove();
+  });
+
+  const ph = (sheetG.height / sheetG.width) * previewW;
+  resizeCanvas(previewW, Math.min(240, Math.max(120, ph + 32)));
+  redraw();
+}
+
+// ---------- Draw YOLOv5 Skeleton ----------
+function drawYoloV5Skeleton(g, person) {
+  // person: array of [x,y,conf] * 17
+  const kp = person.map(p => ({ x: p[0], y: p[1], c: p[2] || 0 }));
+
+  g.stroke(255);
+  g.strokeWeight(LINE_WIDTH);
+  g.noFill();
+
+  // edges
+  for (const [a, b] of EDGES) {
+    if (valid(kp[a]) && valid(kp[b])) g.line(kp[a].x, kp[a].y, kp[b].x, kp[b].y);
+  }
+
+  // optional joint dots
+  if (DRAW_JOINT_DOTS) {
+    g.noStroke(); g.fill(255);
+    for (const p of kp) if (valid(p)) g.circle(p.x, p.y, KP_RADIUS * 2);
+  }
+
+  // simple head circle using eye distance for radius
+  const le = kp[K.le], re = kp[K.re], nose = kp[K.nose];
+  if (valid(le) && valid(re) && valid(nose)) {
+    const r = 1.5 * dist(le.x, le.y, re.x, re.y);
+    g.noFill(); g.stroke(255, 220);
+    g.circle(nose.x, nose.y - r * 0.2, r * 1.2);
+  }
+}
+
+function valid(p) { return p && p.c > 0; }
+
+// p5 loadJSON can return object-with-numeric-keys; normalize to array
+function normalizeJSON(d) {
+  if (Array.isArray(d)) return d;
+  try { return Object.values(d); } catch { return d; }
+}
+
+// ---------- Drag & Drop JSON onto canvas ----------
+function enableDragDrop() {
+  const elt = (canvas || _renderer.elt);
+  elt.addEventListener('dragover', e => e.preventDefault(), false);
+  elt.addEventListener('drop', e => {
+    e.preventDefault();
+    const file = e.dataTransfer.files && e.dataTransfer.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const data = JSON.parse(reader.result);
+        poseData = normalizeJSON(data);
+        buildSpriteSheet();
+      } catch (err) {
+        console.error('Invalid JSON:', err);
+      }
+    };
+    reader.readAsText(file);
+  }, false);
+}
