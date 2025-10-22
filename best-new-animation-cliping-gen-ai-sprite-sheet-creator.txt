@@ -1,0 +1,504 @@
+let posePlayer;
+let headImg;
+
+const fps = 30;
+const poseWidth = 640;
+const poseHeight = 480;
+
+const skeletonEdges = [
+  [5, 7], [7, 9], [6, 8], [8, 10],
+  [11, 13], [13, 15], [12, 14], [14, 16],
+  [5, 6], [11, 12], [5, 11], [6, 12]
+];
+
+let ui;
+
+function preload() {
+  posePlayer = new PosePlayer('bncbc.mp4', 'contraposeetimathion.json');
+  headImg = loadImage('head.png');
+}
+
+function setup() {
+  createCanvas(1280, 720);
+  frameRate(fps);
+  posePlayer.setup();
+
+  // UI: buttons + range controls
+  ui = new UIManager();
+  const btnW = 160, btnH = 40, margin = 12;
+
+  // Presets
+  ui.addButton(new CanvasButton(
+    width - (btnW * 1) - margin,
+    height - btnH - margin,
+    btnW, btnH,
+    'Save 0–2s JSON',
+    () => posePlayer.saveWindowJSON(0, 2)
+  ));
+  ui.addButton(new CanvasButton(
+    width - (btnW * 2) - margin * 2,
+    height - btnH - margin,
+    btnW, btnH,
+    'Save 0–5s JSON',
+    () => posePlayer.saveWindowJSON(0, 5)
+  ));
+
+  // Generic range save (uses Start/Duration inputs defined in setupControls)
+  ui.addButton(new CanvasButton(
+    width - (btnW * 3) - margin * 3,
+    height - btnH - margin,
+    btnW, btnH,
+    'Save Range JSON',
+    () => {
+      const s = parseFloat(posePlayer.startInput.value()) || 0;
+      const d = Math.max(0, parseFloat(posePlayer.durInput.value()) || 0);
+      posePlayer.saveWindowJSON(s, d);
+    }
+  ));
+}
+
+function draw() {
+  background(0);
+  posePlayer.update();
+  posePlayer.display();
+  ui.draw();
+}
+
+function keyPressed() {
+  posePlayer.handleKey(key.toUpperCase());
+}
+
+// ---------------- PosePlayer ----------------
+class PosePlayer {
+  constructor(videoFile, poseJSONFile) {
+    this.videoFile = videoFile;
+    this.poseJSONFile = poseJSONFile;
+
+    this.poseMap = {};
+    this.video = null;
+    this.poseTime = 0;
+    this.playing = false;
+    this.showPose = true;
+    this.playbackRate = 1;
+
+    this.scaleCycle = [1, 0.75, 0.5, 0.25];
+    this.scaleIndex = 0;
+    this.scaleFactor = 1;
+
+    this.pointSizeCycle = [6, 12, 18, 24, 36];
+    this.pointSizeIndex = 1;
+    this.pointSize = this.pointSizeCycle[this.pointSizeIndex];
+    this.headSize = 150;
+
+    this.offsetX = 0;
+    this.offsetY = 0;
+    this.isDragging = false;
+    this.dragStartX = 0;
+    this.dragStartY = 0;
+
+    this.speedInput = null;
+    this.startInput = null;
+    this.durInput = null;
+
+    this.isLoaded = false;
+
+    this.alpha = 120;
+    this.alphaSlider = null;
+
+    this._lastVideoW = null;
+    this._lastVideoH = null;
+
+    this.trails = {};
+    this.showTrails = true;
+    this.maxTrailLen = 240;
+    this.trailAlpha = 160;
+    this.trailWeight = 3;
+    this.trailColors = [
+      [0, 200, 255],
+      [255, 80, 0],
+      [0, 255, 120],
+      [255, 200, 0],
+      [180, 120, 255],
+      [255, 0, 180]
+    ];
+  }
+
+  setup() {
+    this.loadJSONData();
+    this.loadVideo();
+    this.setupControls();
+  }
+
+  loadJSONData() {
+    loadJSON(this.poseJSONFile, data => {
+      this.preparePoseMap(data);
+      this.checkIfLoaded();
+    }, err => console.error("Failed to load JSON:", err));
+  }
+
+  loadVideo() {
+    this.video = createVideo([this.videoFile], () => {
+      this.video.hide();
+      this.video.volume(0);
+      this.video.elt.muted = true;
+      this.video.speed(this.playbackRate);
+      this.checkIfLoaded();
+    }, err => console.error("Failed to load video:", err));
+  }
+
+  checkIfLoaded() {
+    if (this.video && Object.keys(this.poseMap).length > 0) {
+      this.isLoaded = true;
+      this.play();
+    }
+  }
+
+  preparePoseMap(data) {
+    const entries = Array.isArray(data) ? data : Object.values(data);
+    entries.forEach(entry => {
+      const frameId = Number(entry.frame_id ?? entry.frameId ?? entry.frame);
+      if (!Number.isFinite(frameId)) return;
+
+      let persons = entry.persons ?? entry.keypoints ?? entry.kpts;
+      if (!persons) return;
+
+      if (!this.poseMap[frameId]) this.poseMap[frameId] = [];
+
+      if (Array.isArray(persons) && persons.length &&
+          Array.isArray(persons[0]) && Array.isArray(persons[0][0])) {
+        this.poseMap[frameId] = persons;
+      } else if (Array.isArray(persons)) {
+        this.poseMap[frameId].push(persons);
+      }
+    });
+  }
+
+  update() {
+    if (!this.isLoaded || !this.playing) return;
+
+    this.poseTime += (deltaTime / 1000) * this.playbackRate;
+
+    if (this.video && this.video.elt.readyState >= 2) {
+      const dur = this.video.elt.duration || Infinity;
+      if (this.poseTime >= dur) {
+        this.poseTime = dur;
+        this.stop();
+      } else if (abs(this.video.time() - this.poseTime) > 0.1) {
+        this.video.time(this.poseTime);
+      }
+    }
+
+    const keys = Object.keys(this.poseMap);
+    if (keys.length) {
+      const lastFrameNum = Math.max(...keys.map(Number));
+      const lastTime = lastFrameNum / fps;
+      if (this.poseTime >= lastTime) this.stop();
+    }
+
+    this._updateTrails();
+  }
+
+  display() {
+    if (!this.isLoaded) return this.showLoading();
+
+    const videoAspect = poseWidth / poseHeight;
+    const targetHeight = height;
+    const targetWidth = targetHeight * videoAspect;
+
+    this._lastVideoW = targetWidth;
+    this._lastVideoH = targetHeight;
+
+    if (this.video && this.video.elt.readyState >= 2) {
+      image(this.video, 0, 0, targetWidth, targetHeight);
+    }
+
+    if (this.showTrails) this._drawTrails(targetWidth, targetHeight);
+    if (this.showPose) this.drawPoseOverlayToCanvas(targetWidth, targetHeight);
+  }
+
+  showLoading() {
+    push(); textSize(36); fill(255); textAlign(CENTER, CENTER);
+    text('Loading...', width / 2, height / 2); pop();
+  }
+
+  drawPoseOverlayToCanvas(videoW, videoH) {
+    this._drawPoseOverlay(drawingContext, videoW, videoH);
+  }
+
+  _drawPoseOverlay(ctx, videoW, videoH) {
+    const frameIndex = floor(this.poseTime * fps);
+    const persons = this.poseMap[frameIndex] || [];
+
+    push();
+    translate(this.offsetX, this.offsetY);
+    scale(this.scaleFactor);
+
+    const scaleX = videoW / poseWidth;
+    const scaleY = videoH / poseHeight;
+
+    const edgeAlpha = this.alpha;
+    const pointAlpha = this.alpha;
+    const labelAlpha = max(90, this.alpha - 30);
+
+    persons.forEach(kpts => {
+      skeletonEdges.forEach(([i, j]) => {
+        const a = kpts[i], b = kpts[j];
+        if (a && b) {
+          stroke(255, 255, 0, edgeAlpha);
+          strokeWeight(max(3, 4 / this.scaleFactor));
+          line(a[0] * scaleX, a[1] * scaleY, b[0] * scaleX, b[1] * scaleY);
+        }
+      });
+
+      noStroke();
+      fill(255, 0, 0, pointAlpha);
+      kpts.forEach((p, idx) => {
+        if (!p) return;
+        const x = p[0] * scaleX, y = p[1] * scaleY;
+        ellipse(x, y, this.pointSize);
+
+        fill(255, 255, 255, labelAlpha);
+        textAlign(CENTER, CENTER);
+        textSize(max(10, 14 / this.scaleFactor));
+        text(idx.toString(), x, y - this.pointSize);
+
+        if (idx === 0 && headImg) {
+          push();
+          tint(255, this.alpha);
+          imageMode(CENTER);
+          const hs = this.headSize * this.scaleFactor;
+          image(headImg, x, y - hs / 2, hs, hs);
+          pop();
+        }
+      });
+    });
+
+    pop();
+  }
+
+  _updateTrails() {
+    const frameIndex = floor(this.poseTime * fps);
+    const persons = this.poseMap[frameIndex] || [];
+
+    for (let pi = 0; pi < persons.length; pi++) {
+      if (!this.trails[pi]) this.trails[pi] = {};
+      const kpts = persons[pi];
+      for (let ki = 0; ki < kpts.length; ki++) {
+        if (!this.trails[pi][ki]) this.trails[pi][ki] = [];
+        const p = kpts[ki];
+        if (p) {
+          this.trails[pi][ki].push({ x: p[0], y: p[1] });
+          if (this.trails[pi][ki].length > this.maxTrailLen) this.trails[pi][ki].shift();
+        }
+      }
+    }
+  }
+
+  _drawTrails(videoW, videoH) {
+    push();
+    translate(this.offsetX, this.offsetY);
+    scale(this.scaleFactor);
+
+    const scaleX = videoW / poseWidth;
+    const scaleY = videoH / poseHeight;
+    const baseW = max(1.5, this.trailWeight / this.scaleFactor);
+
+    Object.keys(this.trails).forEach(piStr => {
+      const pi = Number(piStr);
+      const [r, g, b] = this.trailColors[pi % this.trailColors.length];
+
+      Object.keys(this.trails[pi]).forEach(kiStr => {
+        const pts = this.trails[pi][kiStr];
+        if (!pts || pts.length < 2) return;
+
+        for (let s = 1; s < pts.length; s++) {
+          const t = s / pts.length;
+          const a = lerp(40, this.trailAlpha, t);
+          stroke(r, g, b, a);
+          strokeWeight(baseW);
+          noFill();
+
+          beginShape();
+          const p0 = pts[max(0, s - 2)];
+          const p1 = pts[s - 1];
+          const p2 = pts[s];
+          const p3 = pts[min(pts.length - 1, s + 1)];
+          curveVertex(p0.x * scaleX, p0.y * scaleY);
+          curveVertex(p1.x * scaleX, p1.y * scaleY);
+          curveVertex(p2.x * scaleX, p2.y * scaleY);
+          curveVertex(p3.x * scaleX, p3.y * scaleY);
+          endShape();
+        }
+      });
+    });
+
+    pop();
+  }
+
+  // --------- Controls ----------
+  setupControls() {
+    const yBase = height - 60;
+    createButton('Play').position(20, yBase).mousePressed(() => this.play());
+    createButton('Pause').position(80, yBase).mousePressed(() => this.pause());
+    createButton('Stop').position(150, yBase).mousePressed(() => this.stop());
+    createButton('Scale').position(210, yBase).mousePressed(() => this.cycleScale());
+
+    createSpan(' Speed:').position(270, yBase + 5);
+    this.speedInput = createInput('1.0').position(330, yBase).size(40);
+    this.speedInput.input(() => this.setSpeed());
+
+    createSpan(' Alpha:').position(375, yBase + 5);
+    this.alphaSlider = createSlider(0, 255, this.alpha, 1).position(425, yBase).size(90);
+    this.alphaSlider.input(() => { this.alpha = this.alphaSlider.value(); });
+
+    createButton('Toggle Trails').position(520, yBase).mousePressed(() => this.showTrails = !this.showTrails);
+    createButton('Clear Trails').position(620, yBase).mousePressed(() => this.clearTrails());
+
+    createSpan(' Len:').position(720, yBase + 5);
+    this.lenSlider = createSlider(10, 1200, this.maxTrailLen, 1).position(750, yBase).size(110);
+    this.lenSlider.input(() => { this.maxTrailLen = this.lenSlider.value(); });
+
+    createSpan(' Thick:').position(865, yBase + 5);
+    this.wSlider = createSlider(1, 10, this.trailWeight, 0.5).position(910, yBase).size(70);
+    this.wSlider.input(() => { this.trailWeight = this.wSlider.value(); });
+
+    // --- Clip range controls ---
+    createSpan('  Start(s):').position(990, yBase + 5);
+    this.startInput = createInput('0').position(1055, yBase).size(40);
+
+    createSpan('  Dur(s):').position(1100, yBase + 5);
+    this.durInput = createInput('2').position(1145, yBase).size(40);
+
+    // Helper: set Start to current time
+    createButton('↘ Start=Now').position(1195, yBase)
+      .mousePressed(() => this.startInput.value((this.poseTime || 0).toFixed(2)));
+  }
+
+  clearTrails() { this.trails = {}; }
+
+  cycleScale() {
+    this.scaleIndex = (this.scaleIndex + 1) % this.scaleCycle.length;
+    this.scaleFactor = this.scaleCycle[this.scaleIndex];
+    this.pointSizeIndex = (this.pointSizeIndex + 1) % this.pointSizeCycle.length;
+    this.pointSize = this.pointSizeCycle[this.pointSizeIndex];
+  }
+
+  setSpeed() {
+    const val = parseFloat(this.speedInput.value());
+    this.playbackRate = isNaN(val) ? 1 : val;
+    if (this.video) this.video.speed(this.playbackRate);
+  }
+
+  play() {
+    this.playing = true;
+    if (this.video && this.video.elt.readyState >= 2) {
+      this.video.play();
+      this.video.speed(this.playbackRate);
+    }
+  }
+
+  pause() { this.playing = false; if (this.video) this.video.pause(); }
+
+  stop() {
+    this.playing = false;
+    this.poseTime = 0;
+    if (this.video) { this.video.pause(); this.video.time(0); }
+  }
+
+  handleKey(k) {
+    if (k === 'T') this.showPose = !this.showPose;
+    if (k === 'P') this.playing ? this.pause() : this.play();
+    if (k === 'S' && this.startInput) this.startInput.value((this.poseTime || 0).toFixed(2)); // S = set start to now
+  }
+
+  mousePressed() {
+    if (this.showPose || this.showTrails) {
+      this.isDragging = true;
+      this.dragStartX = mouseX - this.offsetX;
+      this.dragStartY = mouseY - this.offsetY;
+    }
+  }
+  mouseDragged() { if (this.isDragging) { this.offsetX = mouseX - this.dragStartX; this.offsetY = mouseY - this.dragStartY; } }
+  mouseReleased() { this.isDragging = false; }
+
+  // --------- Export window with RELATIVE ids/times (0-based) ----------
+  saveWindowJSON(startSec = 0, durationSec = 2) {
+    if (!this.isLoaded) return;
+
+    // Sanitize
+    startSec = Math.max(0, Number(startSec) || 0);
+    durationSec = Math.max(0, Number(durationSec) || 0);
+
+    const videoDur = (this.video && isFinite(this.video.elt.duration)) ? this.video.elt.duration : Infinity;
+
+    // Frames: [startFrame, endFrameExclusive)
+    const startFrame = Math.max(0, Math.floor(startSec * fps));
+    const endFrameExclusive = Math.min(
+      Math.floor((startSec + durationSec) * fps),
+      Math.floor((isFinite(videoDur) ? videoDur : Infinity) * fps) + 1
+    );
+
+    const allFrames = Object.keys(this.poseMap).map(Number);
+    if (allFrames.length === 0) return;
+    const maxPoseFrame = Math.max(...allFrames);
+    const hardEnd = Math.min(endFrameExclusive, maxPoseFrame + 1);
+
+    const out = [];
+    for (let f = startFrame; f < hardEnd; f++) {
+      const rel = f - startFrame;                // 0,1,2,...
+      const persons = this.poseMap[f] || [];     // keep timeline continuous
+      const personsCopy = persons.map(kpts =>
+        kpts.map(p => (p ? [p[0], p[1], p[2] ?? 1] : null))
+      );
+
+      out.push({
+        frame_id: rel,                            // relative frame id
+        time_sec: +(rel / fps).toFixed(3),        // relative time from 0
+        persons: personsCopy
+      });
+    }
+
+    const s0 = (0).toFixed(2);
+    const s1 = durationSec.toFixed(2);
+    saveJSON(out, `pose_segment_rel_${s0}-${s1}s.json`);
+  }
+}
+
+// ===== Buttons & UI Manager =====
+class CanvasButton {
+  constructor(x, y, w, h, label, onClick) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.label = label; this.onClick = onClick;
+    this.hover = false; this.pressed = false; this.radius = 10;
+  }
+  contains(px, py) { return px >= this.x && px <= this.x + this.w && py >= this.y && py <= this.y + this.h; }
+  draw() {
+    this.hover = this.contains(mouseX, mouseY);
+    push();
+    noStroke();
+    fill(this.pressed ? 30 : (this.hover ? 50 : 35));
+    rect(this.x, this.y, this.w, this.h, this.radius);
+    stroke(255, 140); noFill(); rect(this.x, this.y, this.w, this.h, this.radius);
+    noStroke(); fill(255); textAlign(CENTER, CENTER); textSize(14);
+    text(this.label, this.x + this.w / 2, this.y + this.h / 2);
+    pop();
+  }
+  mousePressed() { if (this.contains(mouseX, mouseY)) { this.pressed = true; return true; } return false; }
+  mouseReleased() {
+    if (this.pressed && this.contains(mouseX, mouseY)) { this.pressed = false; if (this.onClick) this.onClick(); return true; }
+    this.pressed = false; return false;
+  }
+}
+
+class UIManager {
+  constructor() { this.buttons = []; }
+  addButton(btn) { this.buttons.push(btn); }
+  draw() { this.buttons.forEach(b => b.draw()); }
+  mousePressed() { return this.buttons.some(b => b.mousePressed()); }
+  mouseReleased() { return this.buttons.some(b => b.mouseReleased()); }
+}
+
+// ===== Global mouse events =====
+function mousePressed() { if (ui && ui.mousePressed()) return; posePlayer.mousePressed(); }
+function mouseDragged() { posePlayer.mouseDragged(); }
+function mouseReleased() { if (ui && ui.mouseReleased()) return; posePlayer.mouseReleased(); }
