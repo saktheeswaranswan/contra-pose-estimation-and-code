@@ -1,0 +1,552 @@
+let posePlayer;
+let headImg; // Head image
+
+const fps = 30;
+const poseWidth = 640;
+const poseHeight = 480;
+
+// Skeleton edges
+const skeletonEdges = [
+  [5, 7], [7, 9], [6, 8], [8, 10],
+  [11, 13], [13, 15], [12, 14], [14, 16],
+  [5, 6], [11, 12], [5, 11], [6, 12]
+];
+
+// ===== NEW: Simple in-canvas UI =====
+let ui;
+
+function preload() {
+  posePlayer = new PosePlayer('bncbc.mp4', 'pose_segment_21.70-26.70s.json');
+  headImg = loadImage('head.png'); // Load head image
+}
+
+function setup() {
+  createCanvas(1280, 720);
+  frameRate(fps);
+  posePlayer.setup();
+
+  // ===== NEW: UI manager + Save button in canvas =====
+  ui = new UIManager();
+  const btnW = 180, btnH = 44, margin = 16;
+  ui.addButton(new CanvasButton(
+    width - btnW - margin,
+    height - btnH - margin,
+    btnW,
+    btnH,
+    'Save 5s JSON',
+    () => posePlayer.saveLastNSecondsJSON(5) // export last 5 seconds
+  ));
+}
+
+function draw() {
+  background(0);
+  posePlayer.update();
+  posePlayer.display();
+
+  // draw UI on top
+  ui.draw();
+}
+
+function keyPressed() {
+  posePlayer.handleKey(key.toUpperCase());
+}
+
+// ---------------- PosePlayer Class ----------------
+class PosePlayer {
+  constructor(videoFile, poseJSONFile) {
+    this.videoFile = videoFile;
+    this.poseJSONFile = poseJSONFile;
+
+    this.poseMap = {};       // frame -> [persons -> keypoints[]]
+    this.video = null;
+    this.poseTime = 0;
+    this.playing = false;
+    this.showPose = true;
+    this.playbackRate = 1;
+
+    this.scaleCycle = [1, 0.75, 0.5, 0.25];
+    this.scaleIndex = 0;
+    this.scaleFactor = 1;
+
+    this.pointSizeCycle = [6, 12, 18, 24, 36];
+    this.pointSizeIndex = 1;
+    this.pointSize = this.pointSizeCycle[this.pointSizeIndex];
+    this.headSize = 150; // size of head image
+
+    this.offsetX = 0;
+    this.offsetY = 0;
+    this.isDragging = false;
+    this.dragStartX = 0;
+    this.dragStartY = 0;
+
+    this.speedInput = null;
+    this.isLoaded = false;
+
+    // transparency controls
+    this.alpha = 120; // 0..255
+    this.alphaSlider = null;
+
+    this._lastVideoW = null;
+    this._lastVideoH = null;
+
+    // ===== Trails (loci) =====
+    this.trails = {};        // trails[personIndex][keypointIndex] = [{x,y}, ...]
+    this.showTrails = true;
+    this.maxTrailLen = 240;  // ~8s at 30fps
+    this.trailAlpha = 160;
+    this.trailWeight = 3;
+    this.trailColors = [
+      [0, 200, 255],
+      [255, 80, 0],
+      [0, 255, 120],
+      [255, 200, 0],
+      [180, 120, 255],
+      [255, 0, 180]
+    ];
+  }
+
+  setup() {
+    this.loadJSONData();
+    this.loadVideo();
+    this.setupControls();
+  }
+
+  loadJSONData() {
+    loadJSON(this.poseJSONFile, data => {
+      this.preparePoseMap(data);
+      this.checkIfLoaded();
+    }, err => console.error("Failed to load JSON:", err));
+  }
+
+  loadVideo() {
+    this.video = createVideo([this.videoFile], () => {
+      this.video.hide();
+      this.video.volume(0);
+      this.video.elt.muted = true;
+      this.video.speed(this.playbackRate);
+      this.checkIfLoaded();
+    }, err => console.error("Failed to load video:", err));
+  }
+
+  checkIfLoaded() {
+    if (this.video && Object.keys(this.poseMap).length > 0) {
+      this.isLoaded = true;
+      this.play();
+    }
+  }
+
+  preparePoseMap(data) {
+    // Accept either array of entries or object map; normalize to frame->persons[]
+    const entries = Array.isArray(data) ? data : Object.values(data);
+    entries.forEach(entry => {
+      const frameId = Number(entry.frame_id ?? entry.frameId ?? entry.frame);
+      const persons = entry.persons || entry.keypoints || entry.kpts;
+      if (typeof frameId !== 'number' || !persons) return;
+
+      if (!this.poseMap[frameId]) this.poseMap[frameId] = [];
+      // If source was 1 person per entry (entry.keypoints is an array of points),
+      // wrap as [keypoints]; if already array-of-persons, use as is.
+      if (Array.isArray(persons) && persons.length && Array.isArray(persons[0]) && Array.isArray(persons[0][0])) {
+        // persons already looks like [ [ [x,y,score], ...], [ ... ], ... ]
+        this.poseMap[frameId] = persons;
+      } else if (Array.isArray(persons)) {
+        this.poseMap[frameId].push(persons);
+      }
+    });
+  }
+
+  update() {
+    if (!this.isLoaded || !this.playing) return;
+
+    this.poseTime += (deltaTime / 1000) * this.playbackRate;
+
+    if (this.video && this.video.elt.readyState >= 2) {
+      const dur = this.video.elt.duration || Infinity;
+      if (this.poseTime >= dur) {
+        this.poseTime = dur;
+        this.stop();
+      } else if (abs(this.video.time() - this.poseTime) > 0.1) {
+        this.video.time(this.poseTime);
+      }
+    }
+
+    const lastFrameNum = Math.max(...Object.keys(this.poseMap).map(Number));
+    const lastTime = lastFrameNum / fps;
+    if (this.poseTime >= lastTime) this.stop();
+
+    this._updateTrails();
+  }
+
+  display() {
+    if (!this.isLoaded) {
+      this.showLoading();
+      return;
+    }
+
+    const videoAspect = poseWidth / poseHeight;
+    const targetHeight = height;
+    const targetWidth = targetHeight * videoAspect;
+
+    this._lastVideoW = targetWidth;
+    this._lastVideoH = targetHeight;
+
+    if (this.video && this.video.elt.readyState >= 2) {
+      image(this.video, 0, 0, targetWidth, targetHeight);
+    }
+
+    if (this.showTrails) {
+      this._drawTrails(targetWidth, targetHeight);
+    }
+
+    if (this.showPose) {
+      this.drawPoseOverlayToCanvas(targetWidth, targetHeight);
+    }
+  }
+
+  showLoading() {
+    push();
+    textSize(36);
+    fill(255);
+    textAlign(CENTER, CENTER);
+    text('Loading...', width / 2, height / 2);
+    pop();
+  }
+
+  drawPoseOverlayToCanvas(videoW, videoH) {
+    this._drawPoseOverlay(drawingContext, videoW, videoH);
+  }
+
+  _drawPoseOverlay(ctx, videoW, videoH) {
+    const frameIndex = floor(this.poseTime * fps);
+    const persons = this.poseMap[frameIndex] || [];
+
+    push();
+    translate(this.offsetX, this.offsetY);
+    scale(this.scaleFactor);
+
+    const scaleX = videoW / poseWidth;
+    const scaleY = videoH / poseHeight;
+
+    const edgeAlpha = this.alpha;
+    const pointAlpha = this.alpha;
+    const labelAlpha = max(90, this.alpha - 30);
+
+    persons.forEach(kpts => {
+      // Skeleton
+      skeletonEdges.forEach(([i, j]) => {
+        const a = kpts[i], b = kpts[j];
+        if (a && b) {
+          stroke(255, 255, 0, edgeAlpha);
+          strokeWeight(max(3, 4 / this.scaleFactor));
+          line(a[0] * scaleX, a[1] * scaleY, b[0] * scaleX, b[1] * scaleY);
+        }
+      });
+
+      // Keypoints + labels
+      noStroke();
+      fill(255, 0, 0, pointAlpha);
+      kpts.forEach((p, idx) => {
+        if (!p) return;
+        const x = p[0] * scaleX;
+        const y = p[1] * scaleY;
+        ellipse(x, y, this.pointSize);
+
+        fill(255, 255, 255, labelAlpha);
+        textAlign(CENTER, CENTER);
+        textSize(max(10, 14 / this.scaleFactor));
+        text(idx.toString(), x, y - this.pointSize);
+
+        if (idx === 0 && headImg) {
+          push();
+          tint(255, this.alpha);
+          imageMode(CENTER);
+          const scaledHeadSize = this.headSize * this.scaleFactor;
+          image(headImg, x, y - scaledHeadSize / 2, scaledHeadSize, scaledHeadSize);
+          pop();
+        }
+      });
+    });
+
+    pop();
+  }
+
+  _updateTrails() {
+    const frameIndex = floor(this.poseTime * fps);
+    const persons = this.poseMap[frameIndex] || [];
+
+    for (let pi = 0; pi < persons.length; pi++) {
+      if (!this.trails[pi]) this.trails[pi] = {};
+      const kpts = persons[pi];
+      for (let ki = 0; ki < kpts.length; ki++) {
+        if (!this.trails[pi][ki]) this.trails[pi][ki] = [];
+        const p = kpts[ki];
+        if (p) {
+          this.trails[pi][ki].push({ x: p[0], y: p[1] });
+          if (this.trails[pi][ki].length > this.maxTrailLen) {
+            this.trails[pi][ki].shift();
+          }
+        }
+      }
+    }
+  }
+
+  _drawTrails(videoW, videoH) {
+    push();
+    translate(this.offsetX, this.offsetY);
+    scale(this.scaleFactor);
+
+    const scaleX = videoW / poseWidth;
+    const scaleY = videoH / poseHeight;
+
+    const baseW = max(1.5, this.trailWeight / this.scaleFactor);
+
+    Object.keys(this.trails).forEach(piStr => {
+      const pi = Number(piStr);
+      const [r, g, b] = this.trailColors[pi % this.trailColors.length];
+
+      Object.keys(this.trails[pi]).forEach(kiStr => {
+        const pts = this.trails[pi][kiStr];
+        if (!pts || pts.length < 2) return;
+
+        const segs = pts.length - 1;
+        for (let s = 1; s < pts.length; s++) {
+          const t = s / pts.length; // 0..1
+          const a = lerp(40, this.trailAlpha, t);
+          stroke(r, g, b, a);
+          strokeWeight(baseW);
+          noFill();
+
+          beginShape();
+          const p0 = pts[max(0, s - 2)];
+          const p1 = pts[s - 1];
+          const p2 = pts[s];
+          const p3 = pts[min(pts.length - 1, s + 1)];
+
+          curveVertex(p0.x * scaleX, p0.y * scaleY);
+          curveVertex(p1.x * scaleX, p1.y * scaleY);
+          curveVertex(p2.x * scaleX, p2.y * scaleY);
+          curveVertex(p3.x * scaleX, p3.y * scaleY);
+          endShape();
+        }
+      });
+    });
+
+    pop();
+  }
+
+  // --------- Controls ----------
+  setupControls() {
+    const yBase = height - 60;
+    createButton('Play').position(20, yBase).mousePressed(() => this.play());
+    createButton('Pause').position(100, yBase).mousePressed(() => this.pause());
+    createButton('Stop').position(180, yBase).mousePressed(() => this.stop());
+    createButton('Scale').position(260, yBase).mousePressed(() => this.cycleScale());
+    createSpan(' Speed:').position(340, yBase + 5);
+    this.speedInput = createInput('1.0').position(400, yBase).size(50);
+    this.speedInput.input(() => this.setSpeed());
+
+    createSpan('  Alpha:').position(470, yBase + 5);
+    this.alphaSlider = createSlider(0, 255, this.alpha, 1).position(530, yBase).size(100);
+    this.alphaSlider.input(() => { this.alpha = this.alphaSlider.value(); });
+
+    // Trail controls
+    createButton('Toggle Trails').position(640, yBase).mousePressed(() => this.showTrails = !this.showTrails);
+    createButton('Clear Trails').position(750, yBase).mousePressed(() => this.clearTrails());
+
+    createSpan(' Len:').position(860, yBase + 5);
+    this.lenSlider = createSlider(10, 1200, this.maxTrailLen, 1).position(900, yBase).size(120);
+    this.lenSlider.input(() => { this.maxTrailLen = this.lenSlider.value(); });
+
+    createSpan(' Thick:').position(1030, yBase + 5);
+    this.wSlider = createSlider(1, 10, this.trailWeight, 0.5).position(1080, yBase).size(80);
+    this.wSlider.input(() => { this.trailWeight = this.wSlider.value(); });
+  }
+
+  clearTrails() {
+    this.trails = {};
+  }
+
+  cycleScale() {
+    this.scaleIndex = (this.scaleIndex + 1) % this.scaleCycle.length;
+    this.scaleFactor = this.scaleCycle[this.scaleIndex];
+    this.pointSizeIndex = (this.pointSizeIndex + 1) % this.pointSizeCycle.length;
+    this.pointSize = this.pointSizeCycle[this.pointSizeIndex];
+  }
+
+  setSpeed() {
+    const val = parseFloat(this.speedInput.value());
+    this.playbackRate = isNaN(val) ? 1 : val;
+    if (this.video) this.video.speed(this.playbackRate);
+  }
+
+  play() {
+    this.playing = true;
+    if (this.video && this.video.elt.readyState >= 2) {
+      this.video.play();
+      this.video.speed(this.playbackRate);
+    }
+  }
+
+  pause() {
+    this.playing = false;
+    if (this.video) this.video.pause();
+  }
+
+  stop() {
+    this.playing = false;
+    this.poseTime = 0;
+    if (this.video) {
+      this.video.pause();
+      this.video.time(0);
+    }
+  }
+
+  handleKey(k) {
+    if (k === 'T') this.showPose = !this.showPose;
+    if (k === 'P') this.playing ? this.pause() : this.play();
+  }
+
+  mousePressed() {
+    if (this.showPose || this.showTrails) {
+      this.isDragging = true;
+      this.dragStartX = mouseX - this.offsetX;
+      this.dragStartY = mouseY - this.offsetY;
+    }
+  }
+
+  mouseDragged() {
+    if (this.isDragging) {
+      this.offsetX = mouseX - this.dragStartX;
+      this.offsetY = mouseY - this.dragStartY;
+    }
+  }
+
+  mouseReleased() {
+    this.isDragging = false;
+  }
+
+  // ===== NEW: export last N seconds as JSON =====
+  saveLastNSecondsJSON(nSeconds = 5) {
+    if (!this.isLoaded) return;
+
+    const endFrame = floor(this.poseTime * fps);
+    const startFrame = max(0, endFrame - floor(nSeconds * fps));
+
+    // Build compact export structure:
+    // [
+    //   { frame_id, time_sec, persons: [ [ [x,y,score], ... ], ... ] },
+    //   ...
+    // ]
+    const out = [];
+    for (let f = startFrame; f <= endFrame; f++) {
+      const persons = this.poseMap[f];
+      if (!persons) continue;
+
+      // Deep copy persons[kpt[x,y,score]]
+      const personsCopy = persons.map(kpts =>
+        kpts.map(p => (p ? [p[0], p[1], p[2] ?? 1] : null))
+      );
+
+      out.push({
+        frame_id: f,
+        time_sec: +(f / fps).toFixed(3),
+        persons: personsCopy
+      });
+    }
+
+    const startS = (startFrame / fps).toFixed(2);
+    const endS = (endFrame / fps).toFixed(2);
+    const filename = `pose_segment_${startS}-${endS}s.json`;
+
+    // p5 utility to save JSON
+    saveJSON(out, filename);
+  }
+}
+
+// ===== NEW: In-canvas Button & UI Manager =====
+class CanvasButton {
+  constructor(x, y, w, h, label, onClick) {
+    this.x = x; this.y = y; this.w = w; this.h = h;
+    this.label = label;
+    this.onClick = onClick;
+    this.hover = false;
+    this.pressed = false;
+    this.radius = 10;
+  }
+
+  contains(px, py) {
+    return px >= this.x && px <= this.x + this.w &&
+           py >= this.y && py <= this.y + this.h;
+  }
+
+  draw() {
+    this.hover = this.contains(mouseX, mouseY);
+    push();
+    noStroke();
+    fill( this.pressed ? 30 : (this.hover ? 50 : 35) );
+    rect(this.x, this.y, this.w, this.h, this.radius);
+
+    // subtle border
+    stroke(255, 140);
+    noFill();
+    rect(this.x, this.y, this.w, this.h, this.radius);
+
+    noStroke();
+    fill(255);
+    textAlign(CENTER, CENTER);
+    textSize(16);
+    text(this.label, this.x + this.w / 2, this.y + this.h / 2);
+    pop();
+  }
+
+  mousePressed() {
+    if (this.contains(mouseX, mouseY)) {
+      this.pressed = true;
+      return true;
+    }
+    return false;
+  }
+
+  mouseReleased() {
+    if (this.pressed && this.contains(mouseX, mouseY)) {
+      this.pressed = false;
+      if (this.onClick) this.onClick();
+      return true;
+    }
+    this.pressed = false;
+    return false;
+  }
+}
+
+class UIManager {
+  constructor() {
+    this.buttons = [];
+  }
+  addButton(btn) { this.buttons.push(btn); }
+  draw() { this.buttons.forEach(b => b.draw()); }
+  mousePressed() {
+    // if any UI consumes the press, don't pass to scene
+    for (const b of this.buttons) {
+      if (b.mousePressed()) return true;
+    }
+    return false;
+  }
+  mouseReleased() {
+    for (const b of this.buttons) {
+      if (b.mouseReleased()) return true;
+    }
+    return false;
+  }
+}
+
+// ===== Global mouse events (UI first, then scene) =====
+function mousePressed() {
+  // if UI handled it, skip dragging the scene
+  if (ui && ui.mousePressed()) return;
+  posePlayer.mousePressed();
+}
+function mouseDragged() { posePlayer.mouseDragged(); }
+function mouseReleased() {
+  if (ui && ui.mouseReleased()) return;
+  posePlayer.mouseReleased();
+}
